@@ -90,6 +90,10 @@ const updateMetadata = (data: PlayerData) => {
     ipcRenderer.send('player-update-metadata', data);
 };
 
+const updateArtwork = (url?: null | string) => {
+    ipcRenderer.send('player-update-artwork', url);
+};
+
 const getMetadata = async () => {
     return ipcRenderer.invoke('player-metadata');
 };
@@ -213,6 +217,7 @@ export const mpvPlayer = {
     setQueue,
     setQueueNext,
     stop,
+    updateArtwork,
     updateMetadata,
     volume,
 };

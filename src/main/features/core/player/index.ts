@@ -24,6 +24,11 @@ declare module 'node-mpv';
 
 let mpvInstance: MpvAPI | null = null;
 let currentPlayerData: null | PlayerData = null;
+let currentArtworkUrl: null | string = null;
+let artworkUpdatePromise = Promise.resolve();
+const MPV_ARTWORK_TRACK_TITLE = 'Feishin artwork';
+const MPV_MEDIA_CONTROL_SECTION = 'feishin-media-controls';
+const MPV_PREVIOUS_MESSAGE = 'feishin-previous';
 const socketPath = isWindows() ? `\\\\.\\pipe\\mpvserver-${pid}` : `/tmp/node-mpv-${pid}.sock`;
 
 const NodeMpvErrorCode = {
@@ -130,6 +135,43 @@ const resolveMpvBinaryPath = async (binaryPath?: string) => {
     return undefined;
 };
 
+const configureMacOSMediaControls = async (mpv: MpvAPI) => {
+    if (!isMacOS()) {
+        return;
+    }
+
+    // node-mpv does not forward client-message events through its public event emitter.
+    const mpvSocket = (mpv as any).socket;
+    if (!mpvSocket || typeof mpvSocket.on !== 'function') {
+        log.warn('Unable to listen for mpv media-control commands');
+        return;
+    }
+
+    mpvSocket.on('message', (message: unknown) => {
+        if (!message || typeof message !== 'object') {
+            return;
+        }
+
+        const { args, event } = message as { args?: unknown[]; event?: string };
+        if (event === 'client-message' && args?.[0] === MPV_PREVIOUS_MESSAGE) {
+            getMainWindow()?.webContents.send('renderer-player-previous');
+        }
+    });
+
+    try {
+        // mpv only buffers the current and next songs, so its native playlist cannot go
+        // backwards. Route the macOS Previous command to Feishin's full renderer queue.
+        await mpv.command('define-section', [
+            MPV_MEDIA_CONTROL_SECTION,
+            `PREV script-message ${MPV_PREVIOUS_MESSAGE}`,
+            'force',
+        ]);
+        await mpv.command('enable-section', [MPV_MEDIA_CONTROL_SECTION]);
+    } catch (error) {
+        log.warn('Failed to configure mpv media controls', error);
+    }
+};
+
 const createMpv = async (data: {
     binaryPath?: string;
     extraParameters?: string[];
@@ -159,6 +201,7 @@ const createMpv = async (data: {
 
     try {
         await mpv.start();
+        await configureMacOSMediaControls(mpv);
         log.info('mpv initialized', { binary: resolvedBinaryPath ?? 'bundled/default' });
     } catch (error: any) {
         log.error('mpv failed to start', error);
@@ -169,6 +212,13 @@ const createMpv = async (data: {
     let previousPlaylistPos: number | undefined;
 
     mpv.on('status', (status) => {
+        if (status.property === 'pause' && typeof status.value === 'boolean') {
+            getMainWindow()?.webContents.send(
+                status.value ? 'renderer-player-pause' : 'renderer-player-play',
+            );
+            return;
+        }
+
         if (status.property === 'playlist-pos') {
             const currentPos = typeof status.value === 'number' ? status.value : undefined;
 
@@ -192,19 +242,9 @@ const createMpv = async (data: {
         }
     });
 
-    // Automatically updates the play button when the player is playing
-    mpv.on('resumed', () => {
-        getMainWindow()?.webContents.send('renderer-player-play');
-    });
-
     // Automatically updates the play button when the player is stopped
     mpv.on('stopped', () => {
         getMainWindow()?.webContents.send('renderer-player-stop');
-    });
-
-    // Automatically updates the play button when the player is paused
-    mpv.on('paused', () => {
-        getMainWindow()?.webContents.send('renderer-player-pause');
     });
 
     // Event output every interval set by time_update, used to update the current time
@@ -217,6 +257,59 @@ const createMpv = async (data: {
 
 export const getMpvInstance = () => {
     return mpvInstance;
+};
+
+const updateMpvArtwork = async () => {
+    if (!isMacOS() && !isWindows()) {
+        return;
+    }
+
+    const mpv = getMpvInstance();
+    if (!mpv) {
+        return;
+    }
+
+    let trackList: Array<Record<string, unknown>>;
+    try {
+        trackList = (await mpv.getProperty('track-list')) as unknown as Array<
+            Record<string, unknown>
+        >;
+    } catch {
+        // There is no track list while mpv is idle or between files. The queue-loading
+        // handlers call this function again after the current audio file has loaded.
+        return;
+    }
+
+    const artworkTrackIds = Array.isArray(trackList)
+        ? trackList
+              .filter(
+                  (track) =>
+                      track.type === 'video' &&
+                      track.image === true &&
+                      track.external === true &&
+                      track.title === MPV_ARTWORK_TRACK_TITLE,
+              )
+              .map((track) => track.id)
+              .filter((id): id is number => typeof id === 'number')
+        : [];
+
+    for (const trackId of artworkTrackIds) {
+        await mpv.command('video-remove', [String(trackId)]);
+    }
+
+    if (currentArtworkUrl) {
+        // "auto" keeps the audio-only player from selecting/displaying the image while still
+        // exposing it in track-list for the native macOS/Windows media integrations.
+        await mpv.command('video-add', [currentArtworkUrl, 'auto', MPV_ARTWORK_TRACK_TITLE]);
+    }
+};
+
+const queueMpvArtworkUpdate = () => {
+    artworkUpdatePromise = artworkUpdatePromise.then(updateMpvArtwork).catch((error) => {
+        log.warn('Failed to update mpv artwork', error);
+    });
+
+    return artworkUpdatePromise;
 };
 
 const QUIT_TIMEOUT_MS = 3000;
@@ -452,6 +545,8 @@ ipcMain.on('player-set-queue', async (_event, current?: string, next?: string, p
             if (next) {
                 await getMpvInstance()?.load(next, 'append');
             }
+
+            await queueMpvArtworkUpdate();
         }
 
         if (pause) {
@@ -545,6 +640,11 @@ ipcMain.handle('player-get-time', async (): Promise<number | undefined> => {
 // Updates the current player metadata (song data)
 ipcMain.on('player-update-metadata', (_event, data: PlayerData) => {
     currentPlayerData = data;
+});
+
+ipcMain.on('player-update-artwork', (_event, url?: null | string) => {
+    currentArtworkUrl = url || null;
+    queueMpvArtworkUpdate();
 });
 
 // Returns the current player metadata (song data)

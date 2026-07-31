@@ -3,6 +3,7 @@ import type { RefObject } from 'react';
 import isElectron from 'is-electron';
 import { useEffect, useImperativeHandle, useRef, useState } from 'react';
 
+import { useItemImageUrl } from '/@/renderer/components/item-image/item-image';
 import { eventEmitter } from '/@/renderer/events/event-emitter';
 import { usePlayerEvents } from '/@/renderer/features/player/audio-player/hooks/use-player-events';
 import { getSongUrl } from '/@/renderer/features/player/audio-player/hooks/use-stream-url';
@@ -16,6 +17,7 @@ import {
     usePlayerStore,
     useSettingsStore,
 } from '/@/renderer/store';
+import { LibraryItem } from '/@/shared/types/domain-types';
 import { PlayerStatus } from '/@/shared/types/types';
 
 export interface MpvPlayerEngineHandle extends AudioPlayer {}
@@ -53,6 +55,14 @@ export const MpvPlayerEngine = (props: MpvPlayerEngineProps) => {
 
     const [internalVolume, setInternalVolume] = useState(volume / 100 || 0);
     const currentSong = usePlayerSong();
+    const currentRadioStreamUrl = useRadioStore((state) => state.currentStreamUrl);
+    const artworkUrl = useItemImageUrl({
+        id: currentSong?.imageId,
+        imageUrl: currentSong?.imageUrl,
+        itemType: LibraryItem.SONG,
+        serverId: currentSong?._serverId,
+        type: 'itemCard',
+    });
 
     const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
     const isInitializedRef = useRef<boolean>(false);
@@ -171,6 +181,12 @@ export const MpvPlayerEngine = (props: MpvPlayerEngineProps) => {
         // reloadTrigger is included to allow manual reload via MPV_RELOAD event.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [mpvExtraParameters, mpvProperties, mpvAudioDeviceId, reloadTrigger]);
+
+    // MPV drops external artwork when replacing files. Include the song ID so consecutive
+    // tracks sharing a cover still reattach it, and clear song artwork during radio playback.
+    useEffect(() => {
+        mpvPlayer?.updateArtwork(currentRadioStreamUrl ? null : artworkUrl);
+    }, [artworkUrl, currentRadioStreamUrl, currentSong?._uniqueId]);
 
     // Update volume
     useEffect(() => {
